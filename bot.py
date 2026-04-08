@@ -52,6 +52,7 @@ from telegram_templates import (
     msg_margin_adjustment, msg_pyramid_opened,
 )
 from reconcile_state import reconcile_runtime_state, startup_oanda_reconcile
+from ai_reasoning import ai_should_trade
 
 configure_logging()
 log = get_logger(__name__)
@@ -148,14 +149,16 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("h1_ema_period",             21)            # v5.1 — H1 EMA period for trend
     settings.setdefault("require_candle_close",      True)          # v5.1 — wait for M15 candle close
     settings.setdefault("sl_direction_cooldown_min", 60)            # v5.1 — cooldown after direction guard fires
+    settings.setdefault("post_win_candle_block",     True)          # v5.2 — block entries until M15 candle after TP close + next candle confirmed
+    settings.setdefault("ai_reasoning",              True)          # v5.2 — Claude AI filter before order placement
     settings.setdefault("signal_threshold",          4)
     settings.setdefault("position_full_usd",         100)
     settings.setdefault("position_partial_usd",      66)
     settings.setdefault("account_balance_override",  0)
     settings.setdefault("enabled",                   True)
     settings.setdefault("atr_sl_multiplier",         1.0)           # v4.0 — raised from 0.5
-    settings.setdefault("sl_min_usd",                15.0)          # v4.0 — raised from 4.0
-    settings.setdefault("sl_max_usd",                40.0)          # v4.0 — raised from 20.0
+    settings.setdefault("sl_min_usd",                15.0)          # v5.2 — SL floor = 1500 pips ($15)
+    settings.setdefault("sl_max_usd",                17.0)          # v5.2 — SL ceiling = 1700 pips ($17)
     settings.setdefault("fixed_sl_usd",              20.0)          # v4.0 — raised from 5.0
     settings.setdefault("breakeven_trigger_usd",     15.0)          # v4.0 — raised from 3.0
     settings.setdefault("sl_pct",                   0.0025)
@@ -1331,6 +1334,88 @@ def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, d
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "cooldown_guard"})
         return None
 
+    # ── Post-win M15 candle block (v5.2) ──────────────────────────────────────
+    # After a TP close, block new entries until:
+    #   1. The M15 candle the win closed ON has fully passed, AND
+    #   2. A brand-new M15 candle has opened and confirmed.
+    # This is NOT a cooldown timer — it is purely candle-boundary based.
+    if settings.get("post_win_candle_block", True):
+        _last_win = next(
+            (t for t in reversed(history)
+             if t.get("status") == "FILLED" and (t.get("realized_pnl_usd") or 0) > 0),
+            None,
+        )
+        if _last_win:
+            _closed_at_str = _last_win.get("closed_at_sgt", "")
+            if _closed_at_str:
+                try:
+                    _closed_at = datetime.strptime(_closed_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SGT)
+                    # Which M15 candle did the win close on?
+                    _win_candle_start = _closed_at.replace(
+                        minute=(_closed_at.minute // 15) * 15,
+                        second=0, microsecond=0,
+                    )
+                    _win_candle_end = _win_candle_start + timedelta(minutes=15)
+                    # The very next candle after that also needs to fully open —
+                    # so the block lifts when a new candle starts AFTER win_candle_end.
+                    # i.e. current_candle_start must be >= win_candle_end
+                    _current_candle_start = now_sgt.replace(
+                        minute=(now_sgt.minute // 15) * 15,
+                        second=0, microsecond=0,
+                    )
+                    if _current_candle_start < _win_candle_end:
+                        # Still on the same candle the win closed on
+                        _secs_left = int((_win_candle_end - now_sgt).total_seconds())
+                        _mins_left = max(1, _secs_left // 60)
+                        _msg = (
+                            f"🕯️ Post-win candle block — win closed on M15 candle "
+                            f"{_win_candle_start.strftime('%H:%M')}–{_win_candle_end.strftime('%H:%M')} SGT "
+                            f"(block lifts when next candle opens, ≈{_mins_left}m)"
+                        )
+                        log.info(_msg, extra={"run_id": run_id})
+                        send_once_per_state(
+                            alert, ops, "post_win_candle_state",
+                            f"post_win_same_candle:{_win_candle_start.strftime('%Y-%m-%d %H:%M')}",
+                            _msg,
+                        )
+                        update_runtime_state(
+                            last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                            status="SKIPPED_POST_WIN_CANDLE",
+                        )
+                        db.finish_cycle(run_id, status="SKIPPED",
+                                        summary={"stage": "post_win_candle_block",
+                                                 "win_candle": _win_candle_start.strftime("%H:%M"),
+                                                 "reason": "still_on_win_candle"})
+                        return None
+                    elif _current_candle_start == _win_candle_end:
+                        # On the very next candle right after the win — wait for it to close too
+                        _next_candle_end = _win_candle_end + timedelta(minutes=15)
+                        _secs_left = int((_next_candle_end - now_sgt).total_seconds())
+                        _mins_left = max(1, _secs_left // 60)
+                        _msg = (
+                            f"🕯️ Post-win candle block — confirming next M15 candle "
+                            f"{_current_candle_start.strftime('%H:%M')}–{_next_candle_end.strftime('%H:%M')} SGT "
+                            f"(block lifts when candle closes, ≈{_mins_left}m)"
+                        )
+                        log.info(_msg, extra={"run_id": run_id})
+                        send_once_per_state(
+                            alert, ops, "post_win_candle_state",
+                            f"post_win_confirm_candle:{_current_candle_start.strftime('%Y-%m-%d %H:%M')}",
+                            _msg,
+                        )
+                        update_runtime_state(
+                            last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                            status="SKIPPED_POST_WIN_CANDLE_CONFIRM",
+                        )
+                        db.finish_cycle(run_id, status="SKIPPED",
+                                        summary={"stage": "post_win_candle_block",
+                                                 "win_candle": _win_candle_start.strftime("%H:%M"),
+                                                 "reason": "waiting_for_confirm_candle"})
+                        return None
+                    # else: current candle is ≥ 2 candles after win candle → block lifted, proceed
+                except Exception as _pwe:
+                    log.warning("Post-win candle block check error: %s", _pwe, extra={"run_id": run_id})
+
     window_key = get_window_key(session)
     window_cap = get_window_trade_cap(window_key, settings)
     if window_key and window_cap is not None:
@@ -1676,6 +1761,103 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                         {"rr_ratio": rr_ratio, "tp_pct": tp_pct, "spread_pips": spread_pips,
                          "spread_limit": spread_limit, "session_ok": True, "news_ok": True, "open_trade_ok": True, "margin_ok": True})
 
+    # ── AI Reasoning Filter (v5.2) ─────────────────────────────────────────────
+    # Claude evaluates every qualifying signal before order placement.
+    # HIGH confidence → lot_multiplier 2–3x | LOW confidence → trade blocked.
+    lot_multiplier = 1
+    ai_confidence  = "DISABLED"
+    ai_reason      = "AI reasoning disabled"
+
+    if settings.get("ai_reasoning", True):
+        try:
+            log.info("AI reasoning layer — evaluating trade...", extra={"run_id": run_id})
+            _wins_today   = sum(1 for t in history
+                                if t.get("status") == "FILLED"
+                                and (t.get("realized_pnl_usd") or 0) > 0
+                                and (t.get("timestamp_sgt") or "")[:10] == today)
+            _losses_today = sum(1 for t in history
+                                if t.get("status") == "FILLED"
+                                and (t.get("realized_pnl_usd") or 0) < 0
+                                and (t.get("timestamp_sgt") or "")[:10] == today)
+            _last_loss = next(
+                (t for t in reversed(history)
+                 if t.get("status") == "FILLED" and (t.get("realized_pnl_usd") or 0) < 0),
+                {},
+            )
+            _last_win = next(
+                (t for t in reversed(history)
+                 if t.get("status") == "FILLED" and (t.get("realized_pnl_usd") or 0) > 0),
+                {},
+            )
+            # Build a concise H4 trend string from levels if available
+            _h4_trend = "UNKNOWN"
+            if levels.get("h4_trend"):
+                _h4_trend = str(levels["h4_trend"])
+            elif levels.get("h1_ema_trend"):
+                _h4_trend = str(levels["h1_ema_trend"])
+
+            ai_result = ai_should_trade(
+                direction       = direction,
+                score           = score,
+                price           = entry,
+                signal_details  = details[:400],
+                wins_today      = _wins_today,
+                losses_today    = _losses_today,
+                last_loss_entry = float(_last_loss.get("entry", 0) or 0),
+                last_loss_exit  = float(_last_loss.get("sl_price", 0) or 0),
+                last_loss_dir   = _last_loss.get("direction", ""),
+                last_win_exit   = float(_last_win.get("tp_price", 0) or 0),
+                recent_candles  = [],   # optional: wire up H1 closes for extra context
+                session         = session or "",
+                h4_trend        = _h4_trend,
+                is_asian        = (macro == "Asian"),
+            )
+
+            if not ai_result["allow"]:
+                ai_block_msg = (
+                    f"🤖 AI blocked — {ai_result['reason']} "
+                    f"(confidence={ai_result['confidence']})"
+                )
+                _send_signal_update("BLOCKED", ai_block_msg,
+                                    {"rr_ratio": rr_ratio, "tp_pct": tp_pct,
+                                     "spread_pips": spread_pips, "spread_limit": spread_limit,
+                                     "session_ok": True, "news_ok": True,
+                                     "open_trade_ok": True, "margin_ok": True})
+                log.info("AI BLOCKED entry: %s", ai_result["reason"], extra={"run_id": run_id})
+                alert.send(ai_block_msg)
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_AI_BLOCK",
+                    reason=ai_result["reason"],
+                )
+                db.finish_cycle(run_id, status="SKIPPED",
+                                summary={"stage": "ai_reasoning",
+                                         "reason": ai_result["reason"],
+                                         "confidence": ai_result["confidence"]})
+                return None
+
+            lot_multiplier = int(ai_result.get("lot_multiplier", 1))
+            lot_multiplier = max(1, min(3, lot_multiplier))
+            ai_confidence  = ai_result.get("confidence", "MEDIUM")
+            ai_reason      = ai_result.get("reason", "")
+            log.info(
+                "AI APPROVED | confidence=%s | lot_multiplier=%dx | reason=%s",
+                ai_confidence, lot_multiplier, ai_reason,
+                extra={"run_id": run_id},
+            )
+            # Scale units by lot_multiplier (AI can increase size on HIGH-confidence setups)
+            if lot_multiplier > 1:
+                units = round(units * lot_multiplier, 2)
+                log.info("Units scaled by AI lot_multiplier: %dx → %.2f units",
+                         lot_multiplier, units, extra={"run_id": run_id})
+
+        except Exception as _ai_exc:
+            log.warning("AI reasoning error — proceeding with normal size: %s",
+                        _ai_exc, extra={"run_id": run_id})
+            lot_multiplier = 1
+            ai_confidence  = "ERROR"
+            ai_reason      = str(_ai_exc)[:80]
+
     ctx.update({
         "score": score, "raw_score": raw_score, "direction": direction,
         "details": details, "levels": levels, "position_usd": position_usd,
@@ -1685,6 +1867,9 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
         "spread_pips": spread_pips, "bid": bid, "ask": ask,
         "margin_available": margin_available, "price_for_margin": price_for_margin,
         "margin_info": margin_info,
+        "lot_multiplier": lot_multiplier,
+        "ai_confidence": ai_confidence,
+        "ai_reason": ai_reason,
     })
     return ctx
 
