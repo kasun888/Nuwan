@@ -1,4 +1,4 @@
-"""Main orchestrator for the CPR Gold Bot — v5.1
+"""Main orchestrator for the CPR Gold Bot — v5.2 (V2)
 
 Runs the N-minute trading cycle for XAU/USD (default 5 min), applies
 session and risk controls, places orders through OANDA, manages break-even,
@@ -15,12 +15,30 @@ Active trading windows (SGT) — v4.2:
   Dead Zone: 01:00–15:59  (no new entries — existing trades managed only)
   Asian:     08:00–15:59 SGT — enabled v4.4 for 2-week evaluation
 
-v4.7 (current):
-  - ATR-based SL replaces fixed 0.25% percentage SL
-  - TP always derived from SL via rr_ratio (no more fallback_tp_multiplier hack)
-  - S2/R2 Extended setups hard-blocked when exhaustion stretch > threshold
-  - Breakeven re-enabled at $15 trigger (was disabled in v4.2)
-  - Same-setup cooldown microsecond precision bug fixed
+v5.2 changes (this release):
+  - POST-WIN SCORE IMPROVEMENT LOCK (new):
+    After a TP win at score W, re-entry is blocked until the signal score
+    proves a "fresh setup" via dip-and-recover logic:
+      · score > W immediately        → ALLOW (strict improvement)
+      · score dips below W, recovers → ALLOW (dip confirms fresh momentum)
+      · score stays at W, no dip     → BLOCK (same exhausted level)
+    Toggle via settings key: post_win_score_improve_lock (default True)
+  - SAME-TP-PRICE GUARD (new):
+    After a TP win, if the next signal's computed TP price falls within
+    same_tp_tolerance_usd ($0.50 default) of the previous winning TP,
+    entry is blocked — the market has already swept that level.
+    Toggle via: same_tp_block_enabled (default True)
+    Tune via:   same_tp_tolerance_usd (default 0.50)
+  - Both locks clear automatically when a new trade is successfully placed.
+
+v2.0 / prior changes (retained):
+  - WIN CANDLE LOCK: After a TP close, new entries are blocked until the
+    winning M15 candle has fully closed and a NEW candle has opened.
+    This is state-based (candle boundary), NOT time-based (no cooldown timer).
+  - set_last_win_candle() called inside backfill_pnl() on first TP detection
+  - _guard_phase() checks win candle lock BEFORE signal evaluation
+  - Lock is stored in runtime_state.json and survives process restarts
+  - New settings key: post_win_candle_lock (bool, default True) to toggle
 """
 
 import json
@@ -42,6 +60,12 @@ from startup_checks import run_startup_checks
 from state_utils import (
     RUNTIME_STATE_FILE, SCORE_CACHE_FILE, OPS_STATE_FILE, TRADE_HISTORY_FILE,
     update_runtime_state, load_json, save_json, parse_sgt_timestamp,
+    # v2.0 — Win Candle Lock
+    get_m15_candle_floor, set_last_win_candle, get_last_win_candle, clear_last_win_candle,
+    # v5.2 — Post-win score improvement lock
+    set_post_win_score, get_post_win_score_state, mark_post_win_score_dipped, clear_post_win_score,
+    # v5.2 — Last winning TP price guard
+    set_last_win_tp, get_last_win_tp, clear_last_win_tp,
 )
 from telegram_alert import TelegramAlert
 from telegram_templates import (
@@ -52,7 +76,6 @@ from telegram_templates import (
     msg_margin_adjustment, msg_pyramid_opened,
 )
 from reconcile_state import reconcile_runtime_state, startup_oanda_reconcile
-from ai_reasoning import ai_should_trade
 
 configure_logging()
 log = get_logger(__name__)
@@ -120,7 +143,6 @@ def _build_signal_checks(score: int, direction: str, rr_ratio: float | None = No
 
 
 
-
 def _signal_payload(settings: dict | None = None, **kwargs):
     mandatory_checks, quality_checks, execution_checks = _build_signal_checks(**kwargs, settings=settings)
     return {
@@ -149,16 +171,14 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("h1_ema_period",             21)            # v5.1 — H1 EMA period for trend
     settings.setdefault("require_candle_close",      True)          # v5.1 — wait for M15 candle close
     settings.setdefault("sl_direction_cooldown_min", 60)            # v5.1 — cooldown after direction guard fires
-    settings.setdefault("post_win_candle_block",     True)          # v5.2 — block entries until M15 candle after TP close + next candle confirmed
-    settings.setdefault("ai_reasoning",              True)          # v5.2 — Claude AI filter before order placement
     settings.setdefault("signal_threshold",          4)
     settings.setdefault("position_full_usd",         100)
     settings.setdefault("position_partial_usd",      66)
     settings.setdefault("account_balance_override",  0)
     settings.setdefault("enabled",                   True)
     settings.setdefault("atr_sl_multiplier",         1.0)           # v4.0 — raised from 0.5
-    settings.setdefault("sl_min_usd",                15.0)          # v5.2 — SL floor = 1500 pips ($15)
-    settings.setdefault("sl_max_usd",                17.0)          # v5.2 — SL ceiling = 1700 pips ($17)
+    settings.setdefault("sl_min_usd",                15.0)          # v4.0 — raised from 4.0
+    settings.setdefault("sl_max_usd",                40.0)          # v4.0 — raised from 20.0
     settings.setdefault("fixed_sl_usd",              20.0)          # v4.0 — raised from 5.0
     settings.setdefault("breakeven_trigger_usd",     15.0)          # v4.0 — raised from 3.0
     settings.setdefault("sl_pct",                   0.0025)
@@ -198,6 +218,22 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("session_end_hour_sgt",        1)
     # v4.2 — same-setup re-entry cooldown (microsecond bug fixed in v4.0)
     settings.setdefault("same_setup_cooldown_min",     15)
+    # v2.0 — Win candle lock: block re-entry on the same M15 candle after a TP win
+    # Set to false to disable (not recommended — reverts to v1 behaviour)
+    settings.setdefault("post_win_candle_lock",        True)
+
+    # v5.2 — Post-win score improvement lock
+    # After a TP win at score W, re-entry requires a "dip and recover":
+    #   score > W immediately → ALLOW | score dips below W then recovers → ALLOW
+    #   score stays at W without dipping → BLOCK
+    settings.setdefault("post_win_score_improve_lock", True)
+
+    # v5.2 — Same-TP-price guard
+    # Block entry if the new signal's TP price is within tolerance of the last
+    # winning trade's TP.  Tolerance in USD (default $0.50 ≈ 5 pips on XAUUSD).
+    settings.setdefault("same_tp_block_enabled",       True)
+    settings.setdefault("same_tp_tolerance_usd",       0.50)
+
     # NOTE: fallback_tp_multiplier removed in v4.0 — ATR-based SL makes it redundant
 
     cooldown_min = int(settings.get("loss_streak_cooldown_min", 30))
@@ -856,8 +892,21 @@ def _count_consecutive_sl(history: list, direction: str) -> int:
 # ── PnL backfill ───────────────────────────────────────────────────────────────
 
 def backfill_pnl(history: list, trader, alert, settings: dict) -> list:
+    """Check all open FILLED trades against the broker and record realized PnL.
+
+    v2.0 — WIN CANDLE LOCK integration:
+    When a trade is discovered to have closed with positive PnL (TP hit), we
+    call set_last_win_candle() to record the current M15 candle floor in
+    runtime_state.json.  _guard_phase() will then block any new entry until
+    this candle has fully closed and a new one has opened.
+
+    This is the ONLY place the lock is SET.  It clears automatically in
+    _guard_phase() when a newer candle is detected.
+    """
     changed = False
     demo = settings.get("demo_mode", True)
+    now_sgt = datetime.now(SGT)
+
     for trade in history:
         if trade.get("status") == "FILLED" and trade.get("realized_pnl_usd") is None:
             trade_id = trade.get("trade_id")
@@ -865,9 +914,56 @@ def backfill_pnl(history: list, trader, alert, settings: dict) -> list:
                 pnl = trader.get_trade_pnl(str(trade_id))
                 if pnl is not None:
                     trade["realized_pnl_usd"] = pnl
-                    trade["closed_at_sgt"] = datetime.now(SGT).strftime("%Y-%m-%d %H:%M:%S")
+                    trade["closed_at_sgt"] = now_sgt.strftime("%Y-%m-%d %H:%M:%S")
                     changed = True
                     log.info("Back-filled P&L trade %s: $%.2f", trade_id, pnl)
+
+                    # ── v2.0 WIN CANDLE LOCK ───────────────────────────────
+                    # A positive PnL means this trade just closed as a TP win.
+                    # Record the winning candle so _guard_phase() can block
+                    # re-entry until the NEXT M15 candle opens.
+                    # We only set the lock if it's not already set for this
+                    # same candle (idempotent — safe if backfill runs twice).
+                    if pnl > 0 and settings.get("post_win_candle_lock", True):
+                        current_candle = get_m15_candle_floor(now_sgt)
+                        existing_lock  = get_last_win_candle()
+                        if existing_lock != current_candle:
+                            set_last_win_candle(now_sgt)
+                            log.info(
+                                "WIN detected (trade %s PL=+$%.2f) — win candle lock SET: %s",
+                                trade_id, pnl, current_candle,
+                            )
+                        else:
+                            log.debug(
+                                "WIN detected (trade %s) but candle lock already set for %s — skipping duplicate set",
+                                trade_id, existing_lock,
+                            )
+                    # ──────────────────────────────────────────────────────
+
+                    # ── v5.2 POST-WIN SCORE LOCK ──────────────────────────
+                    # Store the winning trade's score so _signal_phase() can
+                    # enforce dip-and-recover before the next entry is allowed.
+                    if pnl > 0:
+                        _win_score = trade.get("score")
+                        if _win_score is not None:
+                            set_post_win_score(int(_win_score))
+                            log.info(
+                                "Post-win score lock SET — win_score=%d (trade %s)",
+                                int(_win_score), trade_id,
+                            )
+                        # ── v5.2 LAST WIN TP PRICE ────────────────────────
+                        # Store the TP price of this winning trade so that
+                        # _signal_phase() can block a new entry if the next
+                        # signal targets the exact same TP level (stale setup).
+                        _win_tp = trade.get("tp_price")
+                        if _win_tp:
+                            set_last_win_tp(float(_win_tp))
+                            log.info(
+                                "Last win TP price stored: %.2f (trade %s)",
+                                float(_win_tp), trade_id,
+                            )
+                    # ──────────────────────────────────────────────────────
+
                     if not trade.get("closed_alert_sent"):
                         try:
                             _cp  = trade.get("tp_price") if pnl > 0 else trade.get("sl_price")
@@ -1074,7 +1170,30 @@ def _pyramid_phase(db, run_id, settings, alert, trader, history, now_sgt, today,
 
 
 def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, demo) -> dict | None:
-    """All pre-trade guards.  Returns a populated context dict or None (cycle aborted)."""
+    """All pre-trade guards.  Returns a populated context dict or None (cycle aborted).
+
+    Guard order (v2.0):
+      1. Enabled check
+      2. Prune / history save
+      3. Market day guards (Saturday, Sunday, Monday pre-open)
+      4. Calendar refresh
+      5. PnL backfill  ← WIN CANDLE LOCK is SET here when a TP is detected
+      6. Breakeven check
+      7. Early daily loss-cap check
+      8. Loss cooldown notification
+      9. Session check
+      10. Friday cutoff
+      11. News filter
+      12. OANDA login
+      13. Runtime reconcile
+      14. Daily caps (losses, session losses, trade count)
+      15. Loss-streak cooldown gate
+      16. Window cap
+      17. Concurrent trade gate
+      18. ── WIN CANDLE LOCK CHECK ──  ← NEW in v2.0
+          Block new entry if we're still on the same M15 candle a TP fired on.
+          Clears automatically when the next candle opens.
+    """
 
     # ops_state cache: deduplicates operational Telegram alerts (session changes,
     # news blocks, cooldowns, caps). Stored in ops_state.json — separate from
@@ -1134,7 +1253,12 @@ def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, d
         except Exception as e:
             log.warning("Calendar refresh failed (using cached): %s", e, extra={"run_id": run_id})
 
+    # backfill_pnl runs BEFORE the win candle lock check intentionally.
+    # This ensures: if a TP was just hit, the lock is SET in this same cycle,
+    # and then the lock check below immediately blocks the new entry.
+    # Without this ordering, the lock would only take effect one cycle late.
     history[:] = backfill_pnl(history, trader, alert, settings)
+
     # v4.1 — gated by breakeven_enabled (default True).
     # Set breakeven_enabled: false to disable tiered exit entirely.
     if settings.get("breakeven_enabled", True):
@@ -1334,88 +1458,6 @@ def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, d
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "cooldown_guard"})
         return None
 
-    # ── Post-win M15 candle block (v5.2) ──────────────────────────────────────
-    # After a TP close, block new entries until:
-    #   1. The M15 candle the win closed ON has fully passed, AND
-    #   2. A brand-new M15 candle has opened and confirmed.
-    # This is NOT a cooldown timer — it is purely candle-boundary based.
-    if settings.get("post_win_candle_block", True):
-        _last_win = next(
-            (t for t in reversed(history)
-             if t.get("status") == "FILLED" and (t.get("realized_pnl_usd") or 0) > 0),
-            None,
-        )
-        if _last_win:
-            _closed_at_str = _last_win.get("closed_at_sgt", "")
-            if _closed_at_str:
-                try:
-                    _closed_at = datetime.strptime(_closed_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SGT)
-                    # Which M15 candle did the win close on?
-                    _win_candle_start = _closed_at.replace(
-                        minute=(_closed_at.minute // 15) * 15,
-                        second=0, microsecond=0,
-                    )
-                    _win_candle_end = _win_candle_start + timedelta(minutes=15)
-                    # The very next candle after that also needs to fully open —
-                    # so the block lifts when a new candle starts AFTER win_candle_end.
-                    # i.e. current_candle_start must be >= win_candle_end
-                    _current_candle_start = now_sgt.replace(
-                        minute=(now_sgt.minute // 15) * 15,
-                        second=0, microsecond=0,
-                    )
-                    if _current_candle_start < _win_candle_end:
-                        # Still on the same candle the win closed on
-                        _secs_left = int((_win_candle_end - now_sgt).total_seconds())
-                        _mins_left = max(1, _secs_left // 60)
-                        _msg = (
-                            f"🕯️ Post-win candle block — win closed on M15 candle "
-                            f"{_win_candle_start.strftime('%H:%M')}–{_win_candle_end.strftime('%H:%M')} SGT "
-                            f"(block lifts when next candle opens, ≈{_mins_left}m)"
-                        )
-                        log.info(_msg, extra={"run_id": run_id})
-                        send_once_per_state(
-                            alert, ops, "post_win_candle_state",
-                            f"post_win_same_candle:{_win_candle_start.strftime('%Y-%m-%d %H:%M')}",
-                            _msg,
-                        )
-                        update_runtime_state(
-                            last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
-                            status="SKIPPED_POST_WIN_CANDLE",
-                        )
-                        db.finish_cycle(run_id, status="SKIPPED",
-                                        summary={"stage": "post_win_candle_block",
-                                                 "win_candle": _win_candle_start.strftime("%H:%M"),
-                                                 "reason": "still_on_win_candle"})
-                        return None
-                    elif _current_candle_start == _win_candle_end:
-                        # On the very next candle right after the win — wait for it to close too
-                        _next_candle_end = _win_candle_end + timedelta(minutes=15)
-                        _secs_left = int((_next_candle_end - now_sgt).total_seconds())
-                        _mins_left = max(1, _secs_left // 60)
-                        _msg = (
-                            f"🕯️ Post-win candle block — confirming next M15 candle "
-                            f"{_current_candle_start.strftime('%H:%M')}–{_next_candle_end.strftime('%H:%M')} SGT "
-                            f"(block lifts when candle closes, ≈{_mins_left}m)"
-                        )
-                        log.info(_msg, extra={"run_id": run_id})
-                        send_once_per_state(
-                            alert, ops, "post_win_candle_state",
-                            f"post_win_confirm_candle:{_current_candle_start.strftime('%Y-%m-%d %H:%M')}",
-                            _msg,
-                        )
-                        update_runtime_state(
-                            last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
-                            status="SKIPPED_POST_WIN_CANDLE_CONFIRM",
-                        )
-                        db.finish_cycle(run_id, status="SKIPPED",
-                                        summary={"stage": "post_win_candle_block",
-                                                 "win_candle": _win_candle_start.strftime("%H:%M"),
-                                                 "reason": "waiting_for_confirm_candle"})
-                        return None
-                    # else: current candle is ≥ 2 candles after win candle → block lifted, proceed
-                except Exception as _pwe:
-                    log.warning("Post-win candle block check error: %s", _pwe, extra={"run_id": run_id})
-
     window_key = get_window_key(session)
     window_cap = get_window_trade_cap(window_key, settings)
     if window_key and window_cap is not None:
@@ -1446,6 +1488,68 @@ def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, d
         update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"), status="SKIPPED_OPEN_TRADE_CAP")
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "open_trade_guard"})
         return None
+
+    # ── v2.0 WIN CANDLE LOCK ───────────────────────────────────────────────────
+    # After a TP win, block new entries until the winning M15 candle has fully
+    # closed and a brand-new candle has opened.
+    #
+    # WHY HERE (after concurrent trade guard):
+    #   We only apply this guard when we'd otherwise proceed to place a trade.
+    #   If there's already an open trade, the concurrent guard above already
+    #   blocked us — no need to also check the win lock.
+    #
+    # WHY NOT A COOLDOWN TIMER:
+    #   The candle boundary is the natural reset point for the signal engine
+    #   (require_candle_close=True). Using the same boundary here keeps the
+    #   entry logic consistent — a new trade is only ever considered on a NEW
+    #   candle, whether or not a win just happened.
+    if settings.get("post_win_candle_lock", True) and open_count == 0:
+        _last_win_candle = get_last_win_candle()
+        if _last_win_candle:
+            _current_candle = get_m15_candle_floor(now_sgt)
+            if _current_candle == _last_win_candle:
+                # Still on the same M15 candle the TP fired on — block entry.
+                # Calculate when the next candle opens for the Telegram message.
+                _win_floor_dt = SGT.localize(datetime.strptime(_last_win_candle, "%Y-%m-%d %H:%M"))
+                _next_candle  = _win_floor_dt + timedelta(minutes=15)
+                _next_str     = _next_candle.strftime("%H:%M")
+                msg = (
+                    f"🏆 Post-win candle lock active — skipping entry on same M15 candle as TP.\n"
+                    f"Winning candle: {_last_win_candle} SGT | Next candle opens: {_next_str} SGT.\n"
+                    f"Re-evaluating signal on the next clean candle."
+                )
+                send_once_per_state(
+                    alert, ops, "post_win_lock_state",
+                    f"post_win:{_last_win_candle}",
+                    msg,
+                )
+                log_event(
+                    "POST_WIN_CANDLE_LOCK",
+                    f"Entry blocked — same candle as TP win ({_last_win_candle}). Next candle: {_next_str} SGT.",
+                    run_id=run_id,
+                )
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_POST_WIN_CANDLE_LOCK",
+                )
+                db.finish_cycle(
+                    run_id, status="SKIPPED",
+                    summary={
+                        "stage":        "post_win_candle_lock",
+                        "win_candle":   _last_win_candle,
+                        "next_candle":  _next_str,
+                    },
+                )
+                return None
+            else:
+                # A new candle has opened — lock is no longer needed, clear it.
+                clear_last_win_candle()
+                log.info(
+                    "Post-win candle lock CLEARED | was=%s | now=%s | entries re-enabled",
+                    _last_win_candle, _current_candle,
+                    extra={"run_id": run_id},
+                )
+    # ── END WIN CANDLE LOCK ───────────────────────────────────────────────────
 
     return {
         "balance": balance, "account_summary": account_summary,
@@ -1545,6 +1649,84 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
         db.finish_cycle(run_id, status="SKIPPED", summary={"signals": 1, "trades_placed": 0, "score": score, "direction": direction, "reason": f"below_threshold_{threshold}"})
         return None
 
+    # ── v5.2 POST-WIN SCORE IMPROVEMENT LOCK ─────────────────────────────────
+    # After a TP win at score W, re-entry is only allowed when the score has
+    # proven a "fresh setup" via one of these two paths:
+    #   A) score > W immediately (strict improvement) → ALLOW right away
+    #   B) score dips below W at least once, then recovers to W or above → ALLOW
+    # In all other cases (score == W without a prior dip) → BLOCK.
+    #
+    # Important: when score is BELOW threshold (< 4) we do NOT block here —
+    # the threshold check above already returned None.  We only reach this
+    # code when the score is trade-worthy (>= threshold).  So the dip-flag
+    # is implicitly set whenever the cycle above returned None due to the score
+    # falling below threshold AND the post_win_score was still active.
+    # However to be safe we also mark the dip here if score < win_score.
+    if settings.get("post_win_score_improve_lock", True):
+        _pw_score, _pw_dipped = get_post_win_score_state()
+        if _pw_score is not None:
+            if score > _pw_score:
+                # Strict improvement — clear lock and allow
+                log.info(
+                    "Post-win score lock cleared — score %d > win_score %d (strict improvement)",
+                    score, _pw_score, extra={"run_id": run_id},
+                )
+                clear_post_win_score()
+                # fall through to normal entry logic
+            elif score < _pw_score:
+                # Score is below win score — mark dip, then block
+                if not _pw_dipped:
+                    mark_post_win_score_dipped()
+                    log.info(
+                        "Post-win score lock — score %d dipped below win_score %d, dip flag set",
+                        score, _pw_score, extra={"run_id": run_id},
+                    )
+                _pw_reason = (
+                    f"Post-win score lock: score {score}/6 below win score {_pw_score} — "
+                    f"waiting for recovery to {_pw_score}+ before re-entry"
+                )
+                _send_signal_update("BLOCKED", _pw_reason,
+                                    {"session_ok": True, "news_ok": True, "open_trade_ok": True})
+                log.info(_pw_reason, extra={"run_id": run_id})
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_POST_WIN_SCORE_LOCK",
+                )
+                db.finish_cycle(run_id, status="SKIPPED", summary={
+                    "stage": "post_win_score_lock", "score": score,
+                    "win_score": _pw_score, "dipped": _pw_dipped,
+                })
+                return None
+            else:
+                # score == _pw_score
+                if _pw_dipped:
+                    # Dipped before, now recovered to win score — allow
+                    log.info(
+                        "Post-win score lock cleared — score %d recovered after dip (win_score=%d)",
+                        score, _pw_score, extra={"run_id": run_id},
+                    )
+                    clear_post_win_score()
+                    # fall through to normal entry logic
+                else:
+                    # Score came back to win score without a prior dip — block
+                    _pw_reason = (
+                        f"Post-win score lock: score {score}/6 equals win score {_pw_score} "
+                        f"with no prior dip — must dip below {_pw_score} first, then recover"
+                    )
+                    _send_signal_update("BLOCKED", _pw_reason,
+                                        {"session_ok": True, "news_ok": True, "open_trade_ok": True})
+                    log.info(_pw_reason, extra={"run_id": run_id})
+                    update_runtime_state(
+                        last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                        status="SKIPPED_POST_WIN_SCORE_LOCK",
+                    )
+                    db.finish_cycle(run_id, status="SKIPPED", summary={
+                        "stage": "post_win_score_lock", "score": score,
+                        "win_score": _pw_score, "dipped": False,
+                    })
+                    return None
+    # ─────────────────────────────────────────────────────────────────────────
+
     if not settings.get("trade_gold", True):
         update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"), status="SKIPPED_TRADE_GOLD_DISABLED")
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "trade_switch"})
@@ -1624,6 +1806,46 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                         summary={"stage": "rr_gate", "rr_ratio": rr_ratio,
                                  "min_rr": _min_rr, "reason": _rr_reason})
         return None
+
+    # ── v5.2 SAME-TP-PRICE GUARD ─────────────────────────────────────────────
+    # If the newly computed TP price matches the TP of the most recent winning
+    # trade (within tolerance), block entry.  The market has already swept that
+    # level — a fresh signal pointing at the same TP is a stale/echo setup.
+    #
+    # Tolerance default: $0.50 on XAUUSD (~5 pips).  Tune via settings key
+    # "same_tp_tolerance_usd".  Set to 0 to require exact match only.
+    if settings.get("same_tp_block_enabled", True):
+        _last_win_tp   = get_last_win_tp()
+        _tp_tolerance  = float(settings.get("same_tp_tolerance_usd", 0.50))
+        if entry > 0:
+            # Compute the actual TP price from entry ± tp_usd
+            _new_tp_price = round(
+                entry + tp_usd if direction == "BUY" else entry - tp_usd, 2
+            )
+        else:
+            _new_tp_price = None
+        if _last_win_tp is not None and _new_tp_price is not None:
+            if abs(_new_tp_price - _last_win_tp) <= _tp_tolerance:
+                _tp_block_reason = (
+                    f"Same-TP guard: new TP ${_new_tp_price:.2f} matches previous win TP "
+                    f"${_last_win_tp:.2f} (tolerance ±${_tp_tolerance:.2f}) — stale level, skipping"
+                )
+                _send_signal_update("BLOCKED", _tp_block_reason,
+                                    {"rr_ratio": rr_ratio, "tp_pct": tp_pct,
+                                     "session_ok": True, "news_ok": True, "open_trade_ok": True})
+                log.info(_tp_block_reason, extra={"run_id": run_id})
+                update_runtime_state(
+                    last_cycle_filled=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_SAME_TP_PRICE",
+                )
+                db.finish_cycle(run_id, status="SKIPPED", summary={
+                    "stage": "same_tp_guard",
+                    "new_tp": _new_tp_price,
+                    "win_tp": _last_win_tp,
+                    "tolerance": _tp_tolerance,
+                })
+                return None
+    # ─────────────────────────────────────────────────────────────────────────
 
     # v4.1: Consecutive-direction loss guard.
     # After N consecutive SL hits in the same direction, require an elevated
@@ -1761,103 +1983,6 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                         {"rr_ratio": rr_ratio, "tp_pct": tp_pct, "spread_pips": spread_pips,
                          "spread_limit": spread_limit, "session_ok": True, "news_ok": True, "open_trade_ok": True, "margin_ok": True})
 
-    # ── AI Reasoning Filter (v5.2) ─────────────────────────────────────────────
-    # Claude evaluates every qualifying signal before order placement.
-    # HIGH confidence → lot_multiplier 2–3x | LOW confidence → trade blocked.
-    lot_multiplier = 1
-    ai_confidence  = "DISABLED"
-    ai_reason      = "AI reasoning disabled"
-
-    if settings.get("ai_reasoning", True):
-        try:
-            log.info("AI reasoning layer — evaluating trade...", extra={"run_id": run_id})
-            _wins_today   = sum(1 for t in history
-                                if t.get("status") == "FILLED"
-                                and (t.get("realized_pnl_usd") or 0) > 0
-                                and (t.get("timestamp_sgt") or "")[:10] == today)
-            _losses_today = sum(1 for t in history
-                                if t.get("status") == "FILLED"
-                                and (t.get("realized_pnl_usd") or 0) < 0
-                                and (t.get("timestamp_sgt") or "")[:10] == today)
-            _last_loss = next(
-                (t for t in reversed(history)
-                 if t.get("status") == "FILLED" and (t.get("realized_pnl_usd") or 0) < 0),
-                {},
-            )
-            _last_win = next(
-                (t for t in reversed(history)
-                 if t.get("status") == "FILLED" and (t.get("realized_pnl_usd") or 0) > 0),
-                {},
-            )
-            # Build a concise H4 trend string from levels if available
-            _h4_trend = "UNKNOWN"
-            if levels.get("h4_trend"):
-                _h4_trend = str(levels["h4_trend"])
-            elif levels.get("h1_ema_trend"):
-                _h4_trend = str(levels["h1_ema_trend"])
-
-            ai_result = ai_should_trade(
-                direction       = direction,
-                score           = score,
-                price           = entry,
-                signal_details  = details[:400],
-                wins_today      = _wins_today,
-                losses_today    = _losses_today,
-                last_loss_entry = float(_last_loss.get("entry", 0) or 0),
-                last_loss_exit  = float(_last_loss.get("sl_price", 0) or 0),
-                last_loss_dir   = _last_loss.get("direction", ""),
-                last_win_exit   = float(_last_win.get("tp_price", 0) or 0),
-                recent_candles  = [],   # optional: wire up H1 closes for extra context
-                session         = session or "",
-                h4_trend        = _h4_trend,
-                is_asian        = (macro == "Asian"),
-            )
-
-            if not ai_result["allow"]:
-                ai_block_msg = (
-                    f"🤖 AI blocked — {ai_result['reason']} "
-                    f"(confidence={ai_result['confidence']})"
-                )
-                _send_signal_update("BLOCKED", ai_block_msg,
-                                    {"rr_ratio": rr_ratio, "tp_pct": tp_pct,
-                                     "spread_pips": spread_pips, "spread_limit": spread_limit,
-                                     "session_ok": True, "news_ok": True,
-                                     "open_trade_ok": True, "margin_ok": True})
-                log.info("AI BLOCKED entry: %s", ai_result["reason"], extra={"run_id": run_id})
-                alert.send(ai_block_msg)
-                update_runtime_state(
-                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
-                    status="SKIPPED_AI_BLOCK",
-                    reason=ai_result["reason"],
-                )
-                db.finish_cycle(run_id, status="SKIPPED",
-                                summary={"stage": "ai_reasoning",
-                                         "reason": ai_result["reason"],
-                                         "confidence": ai_result["confidence"]})
-                return None
-
-            lot_multiplier = int(ai_result.get("lot_multiplier", 1))
-            lot_multiplier = max(1, min(3, lot_multiplier))
-            ai_confidence  = ai_result.get("confidence", "MEDIUM")
-            ai_reason      = ai_result.get("reason", "")
-            log.info(
-                "AI APPROVED | confidence=%s | lot_multiplier=%dx | reason=%s",
-                ai_confidence, lot_multiplier, ai_reason,
-                extra={"run_id": run_id},
-            )
-            # Scale units by lot_multiplier (AI can increase size on HIGH-confidence setups)
-            if lot_multiplier > 1:
-                units = round(units * lot_multiplier, 2)
-                log.info("Units scaled by AI lot_multiplier: %dx → %.2f units",
-                         lot_multiplier, units, extra={"run_id": run_id})
-
-        except Exception as _ai_exc:
-            log.warning("AI reasoning error — proceeding with normal size: %s",
-                        _ai_exc, extra={"run_id": run_id})
-            lot_multiplier = 1
-            ai_confidence  = "ERROR"
-            ai_reason      = str(_ai_exc)[:80]
-
     ctx.update({
         "score": score, "raw_score": raw_score, "direction": direction,
         "details": details, "levels": levels, "position_usd": position_usd,
@@ -1867,9 +1992,6 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
         "spread_pips": spread_pips, "bid": bid, "ask": ask,
         "margin_available": margin_available, "price_for_margin": price_for_margin,
         "margin_info": margin_info,
-        "lot_multiplier": lot_multiplier,
-        "ai_confidence": ai_confidence,
-        "ai_reason": ai_reason,
     })
     return ctx
 
@@ -2008,6 +2130,14 @@ def _execution_phase(db, run_id, settings, alert, trader, history, now_sgt, toda
             record["tp_price"]     = round(actual_entry + tp_usd if direction == "BUY" else actual_entry - tp_usd, 2)
         else:
             actual_entry = entry
+
+        # ── v5.2 — Clear post-win locks on successful entry ───────────────────
+        # A new trade has been placed — the score-improve lock and same-TP guard
+        # are no longer relevant.  Clear them so they don't carry over and
+        # accidentally block the NEXT signal after this trade resolves.
+        clear_post_win_score()
+        clear_last_win_tp()
+        # ──────────────────────────────────────────────────────────────────────
 
         if ctx.get("is_pyramid"):
             alert.send(msg_pyramid_opened(
