@@ -212,3 +212,39 @@ def clear_last_win_tp() -> None:
     """Clear the last-win TP price (called after a new trade is placed)."""
     update_runtime_state(last_win_tp_price=None)
     logger.info("Last win TP price CLEARED")
+
+
+# ── v5.3 — Post-win ZONE lock ────────────────────────────────────────────────
+# After a TP win, block any new entry whose setup label matches the zone that
+# just won (e.g. "R1 Breakout", "S1 Breakdown", "CPR Bull Breakout"), until
+# EITHER:
+#   (a) a signal fires in a DIFFERENT zone — the lock clears immediately, or
+#   (b) post_win_zone_lock_max_hours has elapsed since the win — safety
+#       fallback so the bot never sits dead if price stays inside the same
+#       zone all day.
+#
+# State stored in runtime_state.json:
+#   last_win_zone     : str — setup label of the winning trade
+#   last_win_zone_ts  : str — SGT timestamp the win was recorded ("%Y-%m-%d %H:%M:%S")
+
+def set_last_win_zone(setup: str, dt: datetime) -> None:
+    """Record the setup/zone label and timestamp of the most recent TP win."""
+    update_runtime_state(
+        last_win_zone=setup,
+        last_win_zone_ts=dt.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    logger.info("Win zone lock SET — zone=%s @ %s (blocked until next zone or max-hours)", setup, dt)
+
+
+def get_last_win_zone() -> tuple[str | None, str | None]:
+    """Return (zone_label, zone_ts_str), or (None, None) if not set / cleared."""
+    state = load_json(RUNTIME_STATE_FILE, {})
+    zone = state.get("last_win_zone")
+    ts   = state.get("last_win_zone_ts")
+    return (zone if zone else None, ts if ts else None)
+
+
+def clear_last_win_zone() -> None:
+    """Explicitly clear the win zone lock."""
+    update_runtime_state(last_win_zone=None, last_win_zone_ts=None)
+    logger.info("Win zone lock CLEARED — entries re-enabled")
