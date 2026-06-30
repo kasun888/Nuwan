@@ -68,6 +68,8 @@ from state_utils import (
     set_last_win_tp, get_last_win_tp, clear_last_win_tp,
     # v5.3 — Post-win zone lock
     set_last_win_zone, get_last_win_zone, clear_last_win_zone,
+    # v5.5 — Post-loss lock
+    set_last_loss_lock, get_last_loss_lock, clear_last_loss_lock,
 )
 from telegram_alert import TelegramAlert
 from telegram_templates import (
@@ -240,6 +242,13 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("target_loss_sgd",       100.0)
     settings.setdefault("target_win_sgd",        200.0)
     settings.setdefault("usd_sgd_fallback_rate", 1.30)
+
+    # v5.5 — Post-loss lock: after ANY losing trade, block all new entries
+    # (any direction, any zone) for post_loss_lock_hours. Mirrors the win
+    # zone lock but is unconditional — simplest possible loss-side brake.
+    settings.setdefault("post_loss_lock_enabled", True)
+    settings.setdefault("post_loss_lock_hours",   6)
+
 
 
     # v5.2 — Post-win score improvement lock
@@ -995,6 +1004,19 @@ def backfill_pnl(history: list, trader, alert, settings: dict) -> list:
                                     "Win zone lock SET — zone=%s (trade %s)",
                                     _win_setup, trade_id,
                                 )
+                    # ──────────────────────────────────────────────────────
+
+                    # ── v5.5 POST-LOSS LOCK ───────────────────────────────
+                    # A negative PnL means this trade just closed as an SL
+                    # loss. Block ALL new entries (any direction, any zone)
+                    # for post_loss_lock_hours — the unconditional loss-side
+                    # mirror of the win zone lock.
+                    elif pnl < 0 and settings.get("post_loss_lock_enabled", True):
+                        set_last_loss_lock(now_sgt)
+                        log.info(
+                            "LOSS detected (trade %s PL=$%.2f) — post-loss lock SET for %sh",
+                            trade_id, pnl, settings.get("post_loss_lock_hours", 6),
+                        )
                     # ──────────────────────────────────────────────────────
 
                     if not trade.get("closed_alert_sent"):
@@ -1848,6 +1870,44 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                     _wz_setup, _wz_current_setup,
                 )
     # ── END WIN ZONE LOCK ───────────────────────────────────────────────────
+
+    # ── v5.5 POST-LOSS LOCK ──────────────────────────────────────────────────
+    # After ANY losing trade, block ALL new entries — any direction, any
+    # zone — for post_loss_lock_hours. Unconditional, simple, time-based.
+    # Clears automatically once the lock window has elapsed.
+    if settings.get("post_loss_lock_enabled", True):
+        _pl_ts_str = get_last_loss_lock()
+        if _pl_ts_str:
+            _pl_ts = _parse_sgt_timestamp(_pl_ts_str)
+            _pl_lock_hours = float(settings.get("post_loss_lock_hours", 6))
+            _pl_age_hrs = ((now_sgt - _pl_ts).total_seconds() / 3600) if _pl_ts else None
+
+            if _pl_age_hrs is not None and _pl_age_hrs < _pl_lock_hours:
+                _pl_remaining = _pl_lock_hours - _pl_age_hrs
+                _pl_reason = (
+                    f"Post-loss lock active: last loss @ {_pl_ts_str} SGT — "
+                    f"blocked for {_pl_remaining:.1f}h more (window={_pl_lock_hours}h)"
+                )
+                _send_signal_update("BLOCKED", _pl_reason,
+                                    {"session_ok": True, "news_ok": True, "open_trade_ok": True})
+                log.info("Post-loss lock blocking entry: %s", _pl_reason, extra={"run_id": run_id})
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_POST_LOSS_LOCK",
+                )
+                db.finish_cycle(run_id, status="SKIPPED", summary={
+                    "stage": "post_loss_lock", "last_loss_ts": _pl_ts_str,
+                    "remaining_hours": round(_pl_remaining, 2),
+                })
+                return None
+            else:
+                # Lock window elapsed — clear it.
+                clear_last_loss_lock()
+                log.info(
+                    "Post-loss lock CLEARED — %.1fh elapsed (window=%.1fh), entries re-enabled",
+                    _pl_age_hrs if _pl_age_hrs is not None else 0, _pl_lock_hours,
+                )
+    # ── END POST-LOSS LOCK ──────────────────────────────────────────────────
 
     # ── Position sizing ───────────────────────────────────────────────────────
     entry = levels.get("entry", 0)
