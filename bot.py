@@ -66,6 +66,8 @@ from state_utils import (
     set_post_win_score, get_post_win_score_state, mark_post_win_score_dipped, clear_post_win_score,
     # v5.2 — Last winning TP price guard
     set_last_win_tp, get_last_win_tp, clear_last_win_tp,
+    # v5.3 — Post-win zone lock
+    set_last_win_zone, get_last_win_zone, clear_last_win_zone,
 )
 from telegram_alert import TelegramAlert
 from telegram_templates import (
@@ -221,6 +223,24 @@ def validate_settings(settings: dict) -> dict:
     # v2.0 — Win candle lock: block re-entry on the same M15 candle after a TP win
     # Set to false to disable (not recommended — reverts to v1 behaviour)
     settings.setdefault("post_win_candle_lock",        True)
+
+    # v5.3 — Post-win ZONE lock: block re-entry on the SAME setup/zone (e.g.
+    # "R1 Breakout", "S1 Breakdown") after a TP win. Clears as soon as a
+    # signal fires in a DIFFERENT zone, or after post_win_zone_lock_max_hours
+    # — whichever comes first. Set post_win_zone_lock false to disable.
+    settings.setdefault("post_win_zone_lock",          True)
+    settings.setdefault("post_win_zone_lock_max_hours", 6)
+
+    # v5.4 — SGD risk target: size every trade so the realized loss lands
+    # near target_loss_sgd and the win near target_win_sgd, converting via
+    # the live USD_SGD rate (falls back to usd_sgd_fallback_rate if the
+    # live quote fails). Set use_sgd_risk_target false to revert to the raw
+    # score-based USD position sizing.
+    settings.setdefault("use_sgd_risk_target",   True)
+    settings.setdefault("target_loss_sgd",       100.0)
+    settings.setdefault("target_win_sgd",        200.0)
+    settings.setdefault("usd_sgd_fallback_rate", 1.30)
+
 
     # v5.2 — Post-win score improvement lock
     # After a TP win at score W, re-entry requires a "dip and recover":
@@ -962,6 +982,19 @@ def backfill_pnl(history: list, trader, alert, settings: dict) -> list:
                                 "Last win TP price stored: %.2f (trade %s)",
                                 float(_win_tp), trade_id,
                             )
+                        # ── v5.3 WIN ZONE LOCK ─────────────────────────────
+                        # Store the setup/zone label of this winning trade so
+                        # _signal_phase() can block re-entry into the SAME
+                        # zone until a different zone fires or the max-hours
+                        # safety window elapses.
+                        if settings.get("post_win_zone_lock", True):
+                            _win_setup = trade.get("setup", "")
+                            if _win_setup:
+                                set_last_win_zone(_win_setup, now_sgt)
+                                log.info(
+                                    "Win zone lock SET — zone=%s (trade %s)",
+                                    _win_setup, trade_id,
+                                )
                     # ──────────────────────────────────────────────────────
 
                     if not trade.get("closed_alert_sent"):
@@ -1766,6 +1799,56 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                 })
                 return None
 
+    # ── v5.3 WIN ZONE LOCK ──────────────────────────────────────────────────
+    # After a TP win, block re-entry into the SAME setup/zone (e.g.
+    # "R1 Breakout", "S1 Breakdown", "CPR Bull Breakout") until EITHER:
+    #   (a) the current signal's setup differs from the zone that won — lock
+    #       clears immediately and this trade is allowed, or
+    #   (b) post_win_zone_lock_max_hours has elapsed since the win — safety
+    #       fallback so the bot doesn't sit dead all day if price stays
+    #       inside the same zone.
+    if settings.get("post_win_zone_lock", True):
+        _wz_setup, _wz_ts_str = get_last_win_zone()
+        if _wz_setup:
+            _wz_current_setup = levels.get("setup", "")
+            _wz_ts = _parse_sgt_timestamp(_wz_ts_str) if _wz_ts_str else None
+            _wz_max_hours = float(settings.get("post_win_zone_lock_max_hours", 6))
+            _wz_age_hrs = ((now_sgt - _wz_ts).total_seconds() / 3600) if _wz_ts else None
+
+            if _wz_age_hrs is not None and _wz_age_hrs >= _wz_max_hours:
+                # Safety fallback expired — clear and allow.
+                clear_last_win_zone()
+                log.info(
+                    "Win zone lock EXPIRED — zone=%s was locked %.1fh (max=%.1fh), entries re-enabled",
+                    _wz_setup, _wz_age_hrs, _wz_max_hours,
+                )
+            elif _wz_current_setup == _wz_setup:
+                _remaining_hrs = (_wz_max_hours - _wz_age_hrs) if _wz_age_hrs is not None else _wz_max_hours
+                _wz_reason = (
+                    f"Win zone lock active: '{_wz_setup}' already won — blocked until a "
+                    f"different zone fires or {_remaining_hrs:.1f}h elapses"
+                )
+                _send_signal_update("BLOCKED", _wz_reason,
+                                    {"session_ok": True, "news_ok": True, "open_trade_ok": True})
+                log.info("Win zone lock blocking entry: %s", _wz_reason, extra={"run_id": run_id})
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_WIN_ZONE_LOCK",
+                )
+                db.finish_cycle(run_id, status="SKIPPED", summary={
+                    "stage": "post_win_zone_lock", "zone": _wz_setup,
+                    "remaining_hours": round(_remaining_hrs, 2), "reason": _wz_reason,
+                })
+                return None
+            else:
+                # A different zone fired — lock is satisfied, clear it.
+                clear_last_win_zone()
+                log.info(
+                    "Win zone lock CLEARED — was=%s | now=%s | entries re-enabled",
+                    _wz_setup, _wz_current_setup,
+                )
+    # ── END WIN ZONE LOCK ───────────────────────────────────────────────────
+
     # ── Position sizing ───────────────────────────────────────────────────────
     entry = levels.get("entry", 0)
     if entry <= 0:
@@ -1774,7 +1857,41 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
 
     sl_usd   = compute_sl_usd(levels, settings)
     tp_usd   = compute_tp_usd(levels, sl_usd, settings)
+
+    # If SGD risk targets are active, force TP to match the target win:loss
+    # ratio exactly (target_win_sgd / target_loss_sgd), overriding whatever
+    # compute_tp_usd derived structurally — keeps both sides of the trade
+    # tied to the same target_loss/target_win SGD figures.
+    if settings.get("use_sgd_risk_target", True):
+        _target_loss_sgd = float(settings.get("target_loss_sgd", 100.0))
+        _target_win_sgd  = float(settings.get("target_win_sgd", 200.0))
+        if _target_loss_sgd > 0:
+            tp_usd = round(sl_usd * (_target_win_sgd / _target_loss_sgd), 2)
+
     rr_ratio = derive_rr_ratio(levels, sl_usd, tp_usd, settings)
+
+    # ── v5.4 SGD RISK TARGET ────────────────────────────────────────────────
+    # position_usd from score_to_position_usd() is a USD risk amount, but the
+    # account is SGD-denominated — the realized PnL you see in Telegram/CSV is
+    # USD risk × live USD/SGD rate, which floats trade to trade. To land
+    # losses near target_loss_sgd and wins near target_win_sgd consistently,
+    # convert the SGD target into USD using the live USD_SGD rate (falling
+    # back to usd_sgd_fallback_rate if the live quote can't be fetched), and
+    # use THAT as the USD risk instead of the raw score-based USD amount.
+    if settings.get("use_sgd_risk_target", True):
+        _target_loss_sgd = float(settings.get("target_loss_sgd", 100.0))
+        _fx_mid, _, _ = trader.get_price("USD_SGD")
+        if not _fx_mid or _fx_mid <= 0:
+            _fx_mid = float(settings.get("usd_sgd_fallback_rate", 1.30))
+            log.warning("SGD risk target: USD_SGD live quote unavailable — using fallback rate %.4f", _fx_mid)
+        _sgd_position_usd = round(_target_loss_sgd / _fx_mid, 2)
+        log.info(
+            "SGD risk target: target_loss=$%.2f SGD @ fx=%.4f → position_usd=$%.2f USD (was $%.2f)",
+            _target_loss_sgd, _fx_mid, _sgd_position_usd, position_usd,
+        )
+        position_usd = _sgd_position_usd
+    # ── END SGD RISK TARGET ─────────────────────────────────────────────────
+
     units    = calculate_units_from_position(position_usd, sl_usd)
     tp_pct   = (tp_usd / entry * 100) if entry > 0 else None
 
