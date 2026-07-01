@@ -249,6 +249,15 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("post_loss_lock_enabled", True)
     settings.setdefault("post_loss_lock_hours",   6)
 
+    # v5.6 — Fixed pip distance override for SL and TP.
+    # For XAU_USD: pip_size = 0.01 (1 pip = $0.01 price movement).
+    # sl_pips=1800 → $18.00 SL distance. tp_pips=3600 → $36.00 TP distance.
+    # Set to 0 or remove to fall back to ATR/CPR structural computation.
+    settings.setdefault("pip_size", 0.01)
+    settings.setdefault("sl_pips",  1800)
+    settings.setdefault("tp_pips",  3600)
+
+
 
 
     # v5.2 — Post-win score improvement lock
@@ -1917,6 +1926,23 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
 
     sl_usd   = compute_sl_usd(levels, settings)
     tp_usd   = compute_tp_usd(levels, sl_usd, settings)
+
+    # ── v5.6 FIXED PIP DISTANCE OVERRIDE ────────────────────────────────────
+    # When sl_pips / tp_pips are set, ignore the ATR/CPR-structural values
+    # from compute_sl_usd/compute_tp_usd and use fixed pip distances instead.
+    # For XAU_USD on OANDA: 1 pip = $0.01, so 1800 pips = $18.00 price move.
+    # Position size is still driven by the SGD risk target below — units will
+    # auto-scale so the realized loss lands near target_loss_sgd.
+    _pip_size = float(settings.get("pip_size", 0.01))
+    if settings.get("sl_pips") and float(settings.get("sl_pips", 0)) > 0:
+        sl_usd = round(float(settings["sl_pips"]) * _pip_size, 2)
+        log.info("Fixed pip SL override: %s pips × %.3f = $%.2f USD price distance",
+                 settings["sl_pips"], _pip_size, sl_usd)
+    if settings.get("tp_pips") and float(settings.get("tp_pips", 0)) > 0:
+        tp_usd = round(float(settings["tp_pips"]) * _pip_size, 2)
+        log.info("Fixed pip TP override: %s pips × %.3f = $%.2f USD price distance",
+                 settings["tp_pips"], _pip_size, tp_usd)
+    # ── END FIXED PIP OVERRIDE ───────────────────────────────────────────────
 
     # If SGD risk targets are active, force TP to match the target win:loss
     # ratio exactly (target_win_sgd / target_loss_sgd), overriding whatever
