@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from bot import run_bot_cycle
+from auto_tuner import run_auto_tune_daily
 from oanda_trader import OandaTrader
 from reporting import (send_daily_report, send_weekly_report, send_monthly_report,
                        send_asian_session_report, send_london_session_report, send_us_session_report)
@@ -83,7 +84,6 @@ def run_db_retention_cleanup():
 def main():
     settings = load_settings()
     cycle_minutes = int(settings.get('cycle_minutes', 5))
-    cycle_seconds = int(settings.get('cycle_seconds', cycle_minutes * 60))
     cleanup_hour = int(settings.get('db_cleanup_hour_sgt', 0))
     cleanup_minute = int(settings.get('db_cleanup_minute_sgt', 15))
     retention_days = int(settings.get('db_retention_days', 90))
@@ -99,12 +99,12 @@ def main():
     scheduler = BlockingScheduler(timezone=SG_TZ)
     scheduler.add_job(
         run_bot_cycle,
-        IntervalTrigger(seconds=cycle_seconds),
+        IntervalTrigger(minutes=cycle_minutes),
         id='trade_cycle',
-        name=f'{cycle_seconds}s trade cycle',
+        name=f'{cycle_minutes}-min trade cycle',
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=max(cycle_seconds, 60),
+        misfire_grace_time=max(cycle_minutes * 60, 60),
     )
 
     scheduler.add_job(
@@ -145,6 +145,16 @@ def main():
         CronTrigger(day_of_week='mon-fri', hour=15, minute=30, timezone=SG_TZ),
         id='daily_report',
         name='Daily performance report',
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Auto-tuner: daily at 08:00 SGT — analyses last N trades, adjusts settings
+    scheduler.add_job(
+        run_auto_tune_daily,
+        CronTrigger(hour=8, minute=0, timezone=SG_TZ),
+        id='auto_tune_daily',
+        name='Daily auto-tune (pattern analysis + settings adjustment)',
         max_instances=1,
         coalesce=True,
     )
@@ -197,7 +207,7 @@ def main():
     signal.signal(signal.SIGINT, _graceful_shutdown)
 
     logger.info('Jobs scheduled:')
-    logger.info('  Trade cycle    — every %s seconds', cycle_seconds)
+    logger.info('  Trade cycle    — every %s minutes', cycle_minutes)
     logger.info('  DB cleanup     — daily at %02d:%02d Asia/Singapore', cleanup_hour, cleanup_minute)
     logger.info('  DB retention   — rolling %s days', retention_days)
     logger.info('  Monthly report — first Monday of month at 08:00 SGT')
@@ -215,7 +225,7 @@ def main():
         _version = f"{BOT_NAME} v{__version__}"
         TelegramAlert().send(msg_startup(
             _version, _mode, _balance, _threshold,
-            cycle_minutes=cycle_seconds // 60 if cycle_seconds >= 60 else cycle_seconds / 60,
+            cycle_minutes=int(settings.get('cycle_minutes', 5)),
             max_trades_london=int(settings.get('max_trades_london', 10)),
             max_trades_us=int(settings.get('max_trades_us', 10)),
             max_trades_tokyo=int(settings.get('max_trades_asian', 5)),

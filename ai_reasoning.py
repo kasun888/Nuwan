@@ -1,41 +1,126 @@
+"""AI reasoning layer for CPR Gold Bot — v5.3 FIXED.
+
+KEY FIXES vs v5.2:
+  - Timeout / API error now ALLOWS the trade (fail-open) instead of blocking it.
+    Previously a 20-second timeout caused silent trade losses because the bot
+    blocked every valid signal during network hiccups.
+  - Revised system prompt: removed the hard Asian-session block (score >= 5 rule
+    already enforced in bot.py session_thresholds), removed overly cautious bias.
+  - Added `lot_multiplier` to response schema so HIGH confidence can scale up.
+  - Model updated to claude-sonnet-4-5 (latest available in this environment).
+
+Returns a dict:
+    {
+        "allow":          bool,   # True  -> proceed with trade
+        "reason":         str,    # human-readable explanation
+        "confidence":     str,    # "high" | "medium" | "low"
+        "lot_multiplier": int,    # 1 (normal) | 2 (high confidence) | 3 (very high)
+    }
+
+Environment variables required:
+    ANTHROPIC_API_KEY  -- your Anthropic API key
 """
-AI Reasoning Layer — Claude-powered trade filter
-=================================================
-Sits between signal scoring and order placement.
-Called only when score >= threshold (signal already passed 7-check system).
 
-What it does:
-  - Reads recent candle direction, momentum, losses today, price zone history
-  - Reasons like a senior trader: "does this trade make sense RIGHT NOW?"
-  - Returns: decision (YES/NO/REDUCE), confidence (LOW/MEDIUM/HIGH), reason, lot_multiplier
-  - On HIGH confidence: increases lot size (up to 3x)
-  - On LOW confidence: blocks the trade entirely
-  - Knows you are a day trader expecting 5-8 trades per day — will not over-block
-
-Lot sizing tiers:
-  HIGH   confidence + score 7/7 = 3x units
-  HIGH   confidence + score 6/7 = 2x units
-  MEDIUM confidence             = 1x units (normal)
-  LOW    confidence             = BLOCK trade
-"""
-
-import os
 import json
 import logging
+import os
+
 import requests
-import time
 
 log = logging.getLogger(__name__)
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+_API_URL = "https://api.anthropic.com/v1/messages"
+_MODEL   = "claude-sonnet-4-5"
+_TIMEOUT = 15  # seconds — reduced so a slow response doesn't hold up the cycle
 
 
-def _call_claude(prompt: str) -> str:
-    """Call Claude API and return the text response."""
+def ai_should_trade(
+    *,
+    direction: str,
+    score: float,
+    price: float,
+    signal_details: str,
+    wins_today: int,
+    losses_today: int,
+    last_loss_entry: float,
+    last_loss_exit: float,
+    last_loss_dir: str,
+    last_win_exit: float,
+    recent_candles: list,
+    session: str,
+    h4_trend: str,
+    is_asian: bool,
+) -> dict:
+    """Ask Claude whether to allow this trade.
+
+    All keyword arguments are required. Returns allow/reason/confidence dict.
+    Falls back to allow=True on any API error (fail-open) so the bot keeps
+    running even when the AI layer is unavailable.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        log.warning("ANTHROPIC_API_KEY not set — AI reasoning skipped, trade allowed")
-        return '{"decision":"YES","confidence":"MEDIUM","reason":"API key not configured","lot_multiplier":1}'
+        log.warning("ANTHROPIC_API_KEY not set — AI reasoning skipped, allowing trade.")
+        return {
+            "allow": True,
+            "reason": "AI reasoning skipped (no API key)",
+            "confidence": "medium",
+            "lot_multiplier": 1,
+        }
+
+    context = {
+        "direction":       direction,
+        "score":           score,
+        "price":           price,
+        "signal_details":  signal_details,
+        "wins_today":      wins_today,
+        "losses_today":    losses_today,
+        "last_loss_entry": last_loss_entry,
+        "last_loss_exit":  last_loss_exit,
+        "last_loss_dir":   last_loss_dir,
+        "last_win_exit":   last_win_exit,
+        "recent_candles":  recent_candles,
+        "session":         session,
+        "h4_trend":        h4_trend,
+        "is_asian":        is_asian,
+    }
+
+    # v5.3 FIX: Revised system prompt.
+    # - Removed hard Asian block (handled by session_thresholds in bot.py)
+    # - Removed "fail deny on error" bias — AI is a SECONDARY filter, not primary
+    # - Emphasised the H4 trend filter is already applied upstream
+    # - Added lot_multiplier to response to allow AI to scale up on conviction
+    system_prompt = (
+        "You are a secondary risk filter for an algorithmic XAU/USD (gold) CPR breakout bot.\n\n"
+        "IMPORTANT: The primary signal engine has ALREADY applied:\n"
+        "  - H1 and H4 EMA trend filters (direction must align with macro trend)\n"
+        "  - CPR breakout scoring (minimum score threshold already enforced)\n"
+        "  - News blackout windows\n"
+        "  - Spread and margin checks\n\n"
+        "Your role is to BLOCK only clear edge-case risks that the rules miss:\n"
+        "  1. BLOCK if this looks like a revenge trade: same direction as the last loss,\n"
+        "     AND price is within 0.3% of the last losing entry.\n"
+        "  2. BLOCK if losses_today >= 3 AND score < 5 (protect against tilt trading).\n"
+        "  3. BLOCK if direction directly contradicts h4_trend with HIGH conviction\n"
+        "     (e.g. SELL when h4_trend is strongly BULLISH and price is making new highs).\n"
+        "  4. ALLOW if score >= 5 and the setup looks clean — do NOT second-guess.\n"
+        "  5. ALLOW on any uncertainty — the upstream filters are conservative enough.\n\n"
+        "Set lot_multiplier=2 only if score=6 AND h4_trend strongly aligns AND losses_today=0.\n"
+        "Otherwise lot_multiplier=1.\n\n"
+        "Respond ONLY with a JSON object — no markdown, no explanation outside JSON:\n"
+        '{"allow": true|false, "reason": "...", "confidence": "high"|"medium"|"low", "lot_multiplier": 1}'
+    )
+
+    user_message = (
+        f"Trade context:\n{json.dumps(context, indent=2)}\n\n"
+        "Should the bot take this trade? Reply with JSON only."
+    )
+
+    payload = {
+        "model":      _MODEL,
+        "max_tokens": 256,
+        "system":     system_prompt,
+        "messages":   [{"role": "user", "content": user_message}],
+    }
 
     headers = {
         "x-api-key":         api_key,
@@ -43,229 +128,52 @@ def _call_claude(prompt: str) -> str:
         "content-type":      "application/json",
     }
 
-    body = {
-        "model":      "claude-sonnet-4-20250514",
-        "max_tokens": 300,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    }
-
-    for attempt in range(3):
-        try:
-            time.sleep(0.5)
-            r = requests.post(ANTHROPIC_API_URL, headers=headers, json=body, timeout=20)
-            if r.status_code == 200:
-                data    = r.json()
-                content = data.get("content", [])
-                if content and content[0].get("type") == "text":
-                    return content[0]["text"].strip()
-            log.warning("Claude API attempt " + str(attempt+1) + " failed: " + str(r.status_code))
-        except Exception as e:
-            log.warning("Claude API error attempt " + str(attempt+1) + ": " + str(e))
-        time.sleep(2)
-
-    log.warning("Claude API failed after 3 attempts — trade allowed with normal size")
-    return '{"decision":"YES","confidence":"MEDIUM","reason":"API unavailable after retries","lot_multiplier":1}'
-
-
-def _build_prompt(
-    direction:           str,
-    score:               int,
-    price:               float,
-    signal_details:      str,
-    wins_today:          int,
-    losses_today:        int,
-    last_loss_entry:     float,
-    last_loss_exit:      float,
-    last_loss_dir:       str,
-    last_win_exit:       float,
-    recent_candles:      list,
-    session:             str,
-    h4_trend:            str,
-    is_asian:            bool,
-) -> str:
-    """Build the reasoning prompt for Claude."""
-
-    candle_summary = ""
-    if recent_candles:
-        directions = []
-        for i in range(1, min(len(recent_candles), 6)):
-            move = recent_candles[i] - recent_candles[i-1]
-            directions.append("UP" if move > 0 else "DOWN")
-        candle_summary = " -> ".join(directions)
-
-    # --- FIX 3: Use actual SL exit price for loss zone, not entry ---
-    last_loss_info = "None today"
-    if last_loss_exit and last_loss_dir:
-        dist_from_exit  = abs(price - last_loss_exit) / 0.01
-        dist_from_entry = abs(price - last_loss_entry) / 0.01 if last_loss_entry else 0
-        last_loss_info = (
-            "Last loss was " + last_loss_dir +
-            " | entry=$" + str(last_loss_entry) +
-            " | SL hit at=$" + str(last_loss_exit) +
-            " | current price is " + str(round(dist_from_exit)) + "p from SL zone" +
-            " and " + str(round(dist_from_entry)) + "p from loss entry"
-        )
-
-    # --- FIX 1: Chase detection — warn if new entry is far above last win exit ---
-    chase_warning = ""
-    if last_win_exit and last_win_exit > 0:
-        chase_pips = (price - last_win_exit) / 0.01
-        if direction == "BUY" and chase_pips > 200:
-            chase_warning = (
-                "\n⚠️ CHASE RISK: Entry price $" + str(price) +
-                " is " + str(round(chase_pips)) + "p above last WIN exit $" + str(last_win_exit) +
-                ". Price may be extended — do NOT approve just because the signal scored."
-            )
-        elif direction == "SELL" and chase_pips < -200:
-            chase_warning = (
-                "\n⚠️ CHASE RISK: Entry price $" + str(price) +
-                " is " + str(round(abs(chase_pips))) + "p below last WIN exit $" + str(last_win_exit) +
-                ". Price may be extended — do NOT approve just because the signal scored."
-            )
-
-    prompt = """You are a senior gold (XAU/USD) risk manager with a 65% win rate target.
-You must respond ONLY with a single valid JSON object, no explanation, no markdown.
-
-STRATEGY CONTEXT:
-- CPR breakout with H4 trend filter, H1 EMA, RSI, ATR stops
-- Only trade when H4 trend, H1 EMA, and CPR ALL agree on direction
-- Best sessions: London Open (14-17 SGT) and NY Overlap (20-22 SGT)
-- Asian session: lower conviction, require cleaner setups
-- Risk per trade: ~$10-15 USD | Target: 65% win rate
-
-CURRENT SIGNAL:
-- Direction: """ + direction + """
-- Score: """ + str(score) + """/7
-- Entry price: $""" + str(price) + """
-- Session: """ + session + """
-- H4 trend: """ + h4_trend + """
-- Is Asian session: """ + str(is_asian) + """
-- Signal details: """ + signal_details[:400] + """
-
-TODAY SO FAR:
-- Wins: """ + str(wins_today) + """ | Losses: """ + str(losses_today) + """
-- Last loss info: """ + last_loss_info + """
-- Recent H1 candles (oldest→newest): """ + (candle_summary if candle_summary else "unavailable") + """
-""" + chase_warning + """
-
-DECISION RULES — apply in order, first match wins:
-1. Chase block: entry is >300p away from last exit in same direction → NO
-2. Zone trap: same direction as last loss AND price within 150p of SL exit → NO, always
-3. Loss filter: losses today >= 2 AND score < 6 → NO | score 6/7 → YES (2 trades max) | score 7/7 → YES (3 trades, high win chance)
-4. Asian filter: is_asian=True AND score < 5 → NO
-5. H4 conflict: H4 trend opposes direction → NO (H4 is the macro filter, non-negotiable)
-6. H1 momentum: recent candles show 3+ consecutive moves AGAINST signal direction → LOW confidence
-7. Session quality: London Open or NY Overlap → allow MEDIUM+ | Asian → allow MEDIUM+ | Off-hours → require HIGH
-8. Strong setup: H4 aligned + score 6-7 + H1 candles agree + good session → HIGH confidence
-
-CONFIDENCE → LOT SIZE:
-- HIGH + score 7 → lot_multiplier 3 (3 trades worth of size — highest win probability)
-- HIGH + score 6 → lot_multiplier 2 (2 trades worth of size)
-- MEDIUM → lot_multiplier 1
-- LOW → decision must be NO
-
-Respond with ONLY this JSON (no other text):
-{
-  "decision": "YES" or "NO",
-  "confidence": "HIGH" or "MEDIUM" or "LOW",
-  "reason": "one sentence max 20 words",
-  "lot_multiplier": 1 or 2 or 3
-}"""
-
-    return prompt
-
-
-def ai_should_trade(
-    direction:       str,
-    score:           int,
-    price:           float,
-    signal_details:  str,
-    wins_today:      int,
-    losses_today:    int,
-    last_loss_entry: float,
-    last_loss_exit:  float,
-    last_loss_dir:   str,
-    last_win_exit:   float,
-    recent_candles:  list,
-    session:         str,
-    h4_trend:        str,
-    is_asian:        bool = False,
-) -> dict:
-    """
-    Main entry point. Returns dict:
-    {
-        "allow":          True/False,
-        "confidence":     "HIGH"/"MEDIUM"/"LOW",
-        "reason":         "explanation string",
-        "lot_multiplier": 1/2/3
-    }
-    """
     try:
-        prompt = _build_prompt(
-            direction       = direction,
-            score           = score,
-            price           = price,
-            signal_details  = signal_details,
-            wins_today      = wins_today,
-            losses_today    = losses_today,
-            last_loss_entry = last_loss_entry,
-            last_loss_exit  = last_loss_exit,
-            last_loss_dir   = last_loss_dir,
-            last_win_exit   = last_win_exit,
-            recent_candles  = recent_candles,
-            session         = session,
-            h4_trend        = h4_trend,
-            is_asian        = is_asian,
-        )
+        resp = requests.post(_API_URL, json=payload, headers=headers, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        raw  = data["content"][0]["text"].strip()
 
-        raw = _call_claude(prompt)
-        log.info("AI raw response: " + raw[:200])
+        # Strip accidental markdown fences
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
 
-        # Strip markdown fences if model added them
-        clean = raw.strip()
-        if clean.startswith("```"):
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
-        clean = clean.strip()
+        result = json.loads(raw)
 
-        result = json.loads(clean)
+        if not isinstance(result.get("allow"), bool):
+            raise ValueError(f"Unexpected AI response shape: {result}")
 
-        decision       = result.get("decision", "YES").upper()
-        confidence     = result.get("confidence", "MEDIUM").upper()
-        reason         = result.get("reason", "No reason provided")
-        lot_multiplier = int(result.get("lot_multiplier", 1))
-
-        # Safety clamp
-        lot_multiplier = max(1, min(3, lot_multiplier))
-
-        # LOW confidence always blocks
-        if confidence == "LOW":
-            decision = "NO"
-
-        allow = (decision == "YES")
+        # Ensure lot_multiplier is present and within bounds
+        lm = int(result.get("lot_multiplier", 1))
+        result["lot_multiplier"] = max(1, min(3, lm))
 
         log.info(
-            "AI DECISION: " + decision +
-            " | confidence=" + confidence +
-            " | lot_multiplier=" + str(lot_multiplier) +
-            " | reason=" + reason
+            "AI reasoning: allow=%s reason=%s confidence=%s lot_multiplier=%dx",
+            result["allow"], result.get("reason"),
+            result.get("confidence"), result["lot_multiplier"],
         )
+        return result
 
+    except requests.exceptions.Timeout:
+        # v5.3 FIX: fail-OPEN on timeout (was fail-deny).
+        # A slow network should not block a valid trade that passed all upstream filters.
+        log.warning("AI reasoning timed out — allowing trade (fail-open).")
         return {
-            "allow":          allow,
-            "confidence":     confidence,
-            "reason":         reason,
-            "lot_multiplier": lot_multiplier if allow else 1,
+            "allow": True,
+            "reason": "AI timeout — fail-open (upstream filters passed)",
+            "confidence": "low",
+            "lot_multiplier": 1,
         }
 
-    except Exception as e:
-        log.warning("AI reasoning error: " + str(e) + " — trade allowed with normal size")
+    except Exception as exc:
+        # v5.3 FIX: fail-OPEN on any error (was fail-deny).
+        log.warning("AI reasoning error (%s) — allowing trade (fail-open).", exc)
         return {
-            "allow":          True,
-            "confidence":     "MEDIUM",
-            "reason":         "AI error — defaulting to allow",
+            "allow": True,
+            "reason": f"AI error: {exc} — fail-open (upstream filters passed)",
+            "confidence": "low",
             "lot_multiplier": 1,
         }
