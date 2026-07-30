@@ -99,5 +99,6 @@
   "post_win_cooldown_hours": 4,
   "ai_reasoning": true,
   "h4_ema_buffer_pct": 0.15,
-  "ai_scale_after_loss": false
+  "ai_scale_after_loss": false,
+  "position_second_trade_usd": 86
 }
